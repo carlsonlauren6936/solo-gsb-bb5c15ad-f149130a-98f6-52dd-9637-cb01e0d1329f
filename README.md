@@ -8,10 +8,21 @@
 3. 对该分配中的**每一对**判断其是否为**强制配对**——即在所有完美匹配中都必然被选择；
 4. 对每个非强制配对，附一组**完整的替代分配**：它本身也是完美匹配，且不包含被审计的这对边。
 
+此外，`POST /repair` 在原图不存在完美匹配时，允许**付费补入候选配对**：
+
+5. 仅从 `candidate_pairings` 中挑选边补入，求使（补入后的图）存在完美匹配的
+   **最小总成本**方案；成本相同时，按新增配对 `(reviewer_id, manuscript_id)`
+   排序后的列表作**字典序择优**；
+6. 成功返回 `added_pairings`、`total_cost` 以及补入后完整图上的 `assignment`
+   （规则与 `/audit` 完全一致）；原图已可行时返回成本 `0` 的空补充；
+   合并全部候选仍不可行时返回 `409`，并在**合并图**上给出 Hall 定理证人。
+
 - 存在完美匹配 → `200`
 - 不存在完美匹配 → `409`，返回基数最大的匹配、未匹配的评审人/稿件 ID，
   以及一份 **Hall 定理证人**（`hall_witness`），**不返回部分成功**
-- 重复 ID、重复配对、未知引用、数量不等、空列表等输入问题 → `422`，错误定位到具体字段与下标
+  （`/repair` 仅在「合并全部候选边后仍不可行」时返回 409）
+- 重复 ID、重复配对、未知引用、数量不等、空列表、候选边与原边重叠、
+  候选成本非正整数等输入问题 → `422`，错误定位到具体字段与下标
 
 技术栈：Python · FastAPI · Pydantic v2 · NetworkX（Hopcroft–Karp + 交替有向图强连通分量）。
 
@@ -27,6 +38,7 @@ docker compose up --build
 
 - API 根地址：<http://localhost:8000/>
 - 审计端点：`POST http://localhost:8000/audit`
+- 修复端点：`POST http://localhost:8000/repair`
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - OpenAPI 模式：<http://localhost:8000/openapi.json>
 - 健康检查：<http://localhost:8000/healthz>
@@ -225,6 +237,125 @@ curl -s -X POST http://localhost:8000/audit \
 
 ---
 
+## 修复端点 `POST /repair`
+
+在 `/audit` 的三个字段之外，再提供一组**候选配对** `candidate_pairings`，
+每条候选是 `{reviewer_id, manuscript_id, cost}`，其中 `cost` 为**正整数**。
+服务只允许从候选中补入边（原图边不产生费用），求使补入后的图存在完美匹配的
+**最小总成本**方案：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `reviewers` | `string[]` | 同 `/audit` |
+| `manuscripts` | `string[]` | 同 `/audit` |
+| `allowed_pairings` | `{reviewer_id, manuscript_id}[]` | 同 `/audit`：原图边（费用视为 0） |
+| `candidate_pairings` | `{reviewer_id, manuscript_id, cost}[]` | 可为空列表但字段必填；`cost` 为正整数；不得重复、不得与原边重叠、引用 ID 必须存在，额外字段拒绝 |
+
+平局规则：总成本相同时，按实际新增配对 `(reviewer_id, manuscript_id)`
+**排序后的列表**作字典序取最优（首位更小者优先；短表是长表前缀时短表优先）。
+
+### 示例请求
+
+原图中 `r2` 没有任何允许配对，因此 `/audit` 会返回 409；提供候选边后请求修复：
+
+```bash
+curl -s -X POST http://localhost:8000/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reviewers": ["r0", "r1", "r2"],
+    "manuscripts": ["m0", "m1", "m2"],
+    "allowed_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"}
+    ],
+    "candidate_pairings": [
+      {"reviewer_id": "r2", "manuscript_id": "m2", "cost": 5},
+      {"reviewer_id": "r2", "manuscript_id": "m1", "cost": 1},
+      {"reviewer_id": "r1", "manuscript_id": "m2", "cost": 2}
+    ]
+  }'
+```
+
+### 200 响应（最小成本修复成功）
+
+```json
+{
+  "perfect_match_exists": true,
+  "added_pairings": [
+    {"reviewer_id": "r1", "manuscript_id": "m2", "cost": 2},
+    {"reviewer_id": "r2", "manuscript_id": "m1", "cost": 1}
+  ],
+  "total_cost": 3,
+  "assignment": [
+    {"reviewer_id": "r0", "manuscript_id": "m0", "forced": true, "alternative": null},
+    {"reviewer_id": "r1", "manuscript_id": "m2", "forced": true, "alternative": null},
+    {"reviewer_id": "r2", "manuscript_id": "m1", "forced": true, "alternative": null}
+  ]
+}
+```
+
+- 单补 `(r2,m2)` 需成本 5；而 `(r1→m2, r2→m1)` 腾挪总成本 3，故取后者；
+- `added_pairings` 按 `(reviewer_id, manuscript_id)` 升序，含各自支付的成本，
+  `total_cost` 为其成本之和；
+- `assignment` 是在「原图边 + 实际新增边」构成的图上，按与 `/audit`
+  **完全相同**的字典序最小规则求出的完整完美匹配（并逐对标注强制性）。
+  未被选中的候选边并未补入，因此每条新增边在该图的所有完美匹配中都会被使用，
+  上例中三对均为 `forced=true`。
+
+**原图已可行**时不补入任何候选边（即使存在更便宜的边），
+返回 `"added_pairings": []`、`"total_cost": 0`，
+且 `assignment` 与对同一输入调用 `/audit` 的结果逐字段一致。
+
+### 平局字典序示例
+
+把上例中 `(r2,m2)` 的成本改为 `3`，则两条修复路径成本同为 3：
+
+- 单条 `[(r2, m2)]`；
+- 双条 `[(r1, m2), (r2, m1)]`（排序后首元素 `(r1,m2) < (r2,m2)`）。
+
+按「排序后列表的字典序」，双条方案胜出，响应中的 `added_pairings` 为
+`[("r1","m2"), ("r2","m1")]`、`total_cost` 为 `3`。
+
+### 409 响应（合并全部候选仍不可行）
+
+若所有候选边都补入后仍不存在完美匹配，返回 `409`，结构与 `/audit` 的
+409 完全一致，但最大匹配与 `hall_witness` 都在**合并图**（原图边 + 全部候选边）
+上构造——证人评审人的可评稿件缺口即「付费也无法修复」之处：
+
+```json
+{
+  "perfect_match_exists": false,
+  "detail": "合并全部候选配对后仍不存在完美匹配；以下为合并图上基数最大的匹配、未匹配双方及 Hall 定理证人，证人评审人的可评稿件缺口即无法修复之处。",
+  "maximum_matching": [
+    {"reviewer_id": "r0", "manuscript_id": "m0"},
+    {"reviewer_id": "r1", "manuscript_id": "m1"}
+  ],
+  "unmatched_reviewer_ids": ["r2"],
+  "unmatched_manuscript_ids": ["m2"],
+  "hall_witness": {
+    "reviewer_ids": ["r2"],
+    "neighboring_manuscript_ids": [],
+    "deficiency": 1
+  }
+}
+```
+
+### 422 响应（候选输入校验失败）
+
+候选相关的语义错误同样聚合返回并精确定位：
+
+| 错误类型 | 触发条件 | `loc` 定位 |
+| --- | --- | --- |
+| `duplicate_candidate_pairing` | 候选配对彼此重复 | `body.candidate_pairings.<下标>` |
+| `overlaps_existing_pairing` | 候选配对已存在于 `allowed_pairings`（无需补入） | `body.candidate_pairings.<下标>` |
+| `unknown_reviewer` / `unknown_manuscript` | 候选引用了不存在的 ID | `body.candidate_pairings.<下标>.reviewer_id` / `.manuscript_id` |
+| `non_positive_cost` | `cost` ≤ 0（合法整数但非正数） | `body.candidate_pairings.<下标>.cost` |
+| `int_type` / `value_error` | `cost` 不是整数（如 `1.5`、`"7"`、布尔值 `true/false`）或字段缺失（Pydantic 内建，严格整数） | `body.candidate_pairings.<下标>.cost` |
+
+`/audit` 的全部错误类型（数量不等、重复 ID 等）在 `/repair` 上同样适用。
+
+---
+
 ## 算法说明
 
 - **最大匹配 / 完美匹配判定**：NetworkX 的 Hopcroft–Karp
@@ -245,6 +376,15 @@ curl -s -X POST http://localhost:8000/audit \
   N(S) 恰为 Z ∩ 稿件，且 `|S| − |N(S)|` = 未匹配评审人数 = 全局缺口
   （Kőnig–Ore 定理）。源点与邻接均按 ID 排序，可达集与遍历顺序无关，
   证人对相同输入完全确定。
+- **最小成本修复（/repair）**：原图边费用为 0、候选边费用为正整数，
+  最小总成本方案即合并图上的最小费用完美匹配（实现为三层流网络上的
+  Johnson 初始势 + Dijkstra 连续最短路，全程精确整数，无需 SciPy）。
+  成本相同时的「按新增配对排序列表取字典序」无法用单一边权编码
+  （小边优先与「短表优先」方向相反），故采用前缀贪心：每轮先用
+  Hopcroft–Karp 判定「仅原图边 + 已选前缀」是否已可行（可行即按短表终止），
+  否则在候选边上叠加超递增入选奖励权（`cost·2^K − 2^(K-1-i)`）求一次
+  费用匹配，其使用的最小候选边即下一条必入边；轮数不超过评审人数。
+  最终在补入后的完整图上复用上述字典序最小分配 + SCC 强制性审计。
 
 适用规模：典型会议量级（两侧各 ≤100、每人若干候选）亚秒级完成；
 数百规模也可在数秒级返回。
@@ -254,12 +394,15 @@ curl -s -X POST http://localhost:8000/audit \
 ```
 app/
   __init__.py
-  main.py        # FastAPI 路由、422/409 语义校验与响应组装
-  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人
+  main.py        # FastAPI 路由（/audit、/repair）、422/409 语义校验与响应组装
+  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人、
+                 # 最小费用修复（SSP + 超递增扰动前缀贪心）
   schemas.py     # Pydantic 请求/响应模型
 tests/
-  test_api.py    # HTTP 层：200/409/422、Hall 证人与错误定位
-  test_matching.py# 算法层：200 组随机图全排列暴力交叉验证 + Hall 证人不变量
+  test_api.py       # /audit HTTP 层：200/409/422、Hall 证人与错误定位
+  test_matching.py  # /audit 算法层：200 组随机图全排列暴力交叉验证 + Hall 不变量
+  test_repair.py    # /repair 算法层：400 组随机图暴力交叉验证（成本/字典序/Hall）
+  test_repair_api.py# /repair HTTP 层：最小成本、平局、409、422 精确定位
 Dockerfile
 docker-compose.yml
 requirements.txt

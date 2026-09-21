@@ -389,3 +389,289 @@ def run_audit(
         pairs=entries,
         max_matching_size=max_size,
     )
+
+
+
+# ---------------------------------------------------------------------------
+# POST /repair：最小成本补边修复
+# ---------------------------------------------------------------------------
+#
+# 建模
+# ----
+# 原图边（allowed_pairings）成本为 0；候选边成本为各自的正整数 cost。
+# 任一完美匹配的成本 = 其中候选边的成本之和，故「最小总成本的补边方案」
+# 等价于合并图上的最小费用完美匹配，实际被补入的边即该匹配使用的候选边。
+#
+# 字典序平局裁决（成本相同时，按新增配对 (reviewer_id, manuscript_id)
+# 排序后的列表作字典序择优）
+# ---------------------------------------------------------------------
+# 该顺序无法用「每条边一个独立权」的单目标权值编码：同时有
+#   {e0} ≺ {e1,e2}（首位更小者胜，即使边数更多）
+#   {e0}  ≺ {e0,e1}（短表是长表前缀时，边数更少者胜）
+# 前一条要求小边的「入选奖励」压过其后所有边之和，后一条又要求多入选边
+# 必须付出正代价——任何固定边权都不能两全。故采用前缀贪心：
+#
+#   P 为已确定入选的候选边（按 ID 升序的前缀）。每轮：
+#   1. 若仅靠原图边 + 强制 P 即可完美匹配（Hopcroft–Karp 判定），
+#      则 P 已构成某个最优方案，立即终止（短表优先）；
+#   2. 否则在「P 强制、编号早于扫描位置的候选边禁用」的图上求一个
+#      最优匹配 M，取 M 使用的最小候选边 t 并入 P，扫描位置推进到 t 之后。
+#
+# 正确性（为什么 t 恰为最小可延伸边）
+# ----------------------------------
+# 最优匹配在真实费用之外叠加「超递增入选奖励」扰动：候选边 e_i
+# （按 (reviewer_id, manuscript_id) 升序编号 0..K-1）权值为
+#       cost_i · 2^K − 2^(K-1-i)
+# 总扰幅 < 2^K，故首目标仍是真实费用；在同费用匹配中，扰动最优者
+# 「尽可能在最小编号位上入选」。若存在 s<t 能延伸前缀（强制 P∪{s}
+# 仍有费用 OPT 的匹配 N），则 N 含 s 而 M 不含任何编号 <t 的候选边，
+# 由超递增性 pert(N) < pert(M)，与 M 的扰动最优矛盾；故最小的可延伸边
+# 恰为 t。而 M 自身又证明强制 P∪{t} 可行（其用到的其余候选边编号均 ≥t，
+# 在该轮允许范围内）。每轮新增一条边，轮数不超过 n。
+#
+# 费用匹配用 Johnson 初始势 + Dijkstra 的连续最短路（SSP）自行实现：
+# 前向网络 S→评审人→稿件→T 是三层 DAG，初始势直接按层松弛得到，
+# 扰动产生的负边权亦被势函数消解为非负折算费用；全部运算为精确整数。
+
+import heapq
+
+
+@dataclass
+class RepairResult:
+    """算法层修复结果（成功时）。"""
+
+    added: list[tuple[str, str, int]]
+    total_cost: int
+    #: 补入后完整图上的审计结果（必然存在完美匹配）。
+    audit: AuditResult
+
+
+class _NoPerfectMatching(Exception):
+    """费用网络中不存在铺满全部评审人的完美匹配。"""
+
+
+def _add_flow_edge(graph: list[list[list]], u: int, v: int, weight: int) -> None:
+    """在邻接表网络中加入容量 1 的前向边及其容量 0 的反向残余边。"""
+    forward = [v, len(graph[v]), 1, weight]
+    backward = [u, len(graph[u]), 0, -weight]
+    graph[u].append(forward)
+    graph[v].append(backward)
+
+
+def _min_cost_matching_ssp(
+    free_reviewers: list[str],
+    free_manuscripts: list[str],
+    weighted_edges: list[tuple[str, str, int]],
+) -> list[tuple[str, str]]:
+    """三层网络上的最小费用完美匹配（SSP + Johnson 势 + Dijkstra）。
+
+    ``weighted_edges`` 为 ``(reviewer_id, manuscript_id, 整数权)``；
+    返回被选中的边列表。权允许为负（精确整数），不存在完美匹配时抛
+    :class:`_NoPerfectMatching`。
+    """
+    nr = len(free_reviewers)
+    nm = len(free_manuscripts)
+    if nr != nm:
+        raise _NoPerfectMatching
+
+    # 节点编号：0 = S；评审人 1..nr；稿件 nr+1..nr+nm；T = nr+nm+1。
+    r_index = {r: i + 1 for i, r in enumerate(free_reviewers)}
+    m_index = {m: nr + 1 + i for i, m in enumerate(free_manuscripts)}
+    source = 0
+    sink = nr + nm + 1
+    node_count = sink + 1
+    graph: list[list[list]] = [[] for _ in range(node_count)]
+
+    for r in free_reviewers:
+        _add_flow_edge(graph, source, r_index[r], 0)
+    for m in free_manuscripts:
+        _add_flow_edge(graph, m_index[m], sink, 0)
+
+    # 记录前向评审人→稿件边及其在邻接表中的下标，便于最终抽取匹配。
+    forward_refs: list[tuple[int, int, str, str]] = []
+    for r, m, weight in weighted_edges:
+        u = r_index[r]
+        v = m_index[m]
+        ei = len(graph[u])
+        _add_flow_edge(graph, u, v, weight)
+        forward_refs.append((u, ei, r, m))
+
+    # 初始势：前向网络为 S→R(权0)→M(权可能为负)→T(权0) 的三层 DAG，
+    # 按层做一次最短路径松弛即得各节点最短距离，作为 Johnson 初始势。
+    potential: list[int | None] = [None] * node_count
+    potential[source] = 0
+    for r in free_reviewers:
+        potential[r_index[r]] = 0
+    for u, ei, _r, _m in forward_refs:
+        weight = graph[u][ei][3]
+        v = graph[u][ei][0]
+        cand = potential[u] + weight
+        if potential[v] is None or cand < potential[v]:
+            potential[v] = cand
+    sink_pot: int | None = None
+    for m in free_manuscripts:
+        p = potential[m_index[m]]
+        if p is not None and (sink_pot is None or p < sink_pot):
+            sink_pot = p
+    potential[sink] = sink_pot
+
+    # SSP：每轮以非负折算费用做 Dijkstra，增广一条单位流。
+    for _ in range(nr):
+        dist: list[int | None] = [None] * node_count
+        parent_node = [-1] * node_count
+        parent_edge = [-1] * node_count
+        dist[source] = 0
+        heap: list[tuple[int, int]] = [(0, source)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if dist[u] is not None and d > dist[u]:
+                continue
+            pu = potential[u]
+            for ei, edge in enumerate(graph[u]):
+                v, _rev, cap, weight = edge
+                if cap == 0 or potential[v] is None or pu is None:
+                    continue
+                reduced = weight + pu - potential[v]  # 折算费用恒非负。
+                nd = d + reduced
+                if dist[v] is None or nd < dist[v]:
+                    dist[v] = nd
+                    parent_node[v] = u
+                    parent_edge[v] = ei
+                    heapq.heappush(heap, (nd, v))
+        if dist[sink] is None:
+            raise _NoPerfectMatching
+        for v in range(node_count):
+            if dist[v] is not None and potential[v] is not None:
+                potential[v] += dist[v]
+
+        # 沿父指针增广单位流（单容量网络，瓶颈恒为 1）。
+        v = sink
+        while v != source:
+            u = parent_node[v]
+            ei = parent_edge[v]
+            edge = graph[u][ei]
+            edge[2] -= 1
+            graph[v][edge[1]][2] += 1
+            v = u
+
+    # 前向边容量已由 1 变 0 者，即匹配选中的评审人→稿件边。
+    chosen: list[tuple[str, str]] = []
+    for u, ei, r, m in forward_refs:
+        if graph[u][ei][2] == 0:
+            chosen.append((r, m))
+    return chosen
+
+
+def _original_only_feasible(
+    reviewers: list[str],
+    manuscripts: list[str],
+    zero_edges: list[tuple[str, str]],
+    used_reviewers: set[str],
+    used_manuscripts: set[str],
+) -> bool:
+    """仅靠原图边（费用 0）+ 已强制占用节点，剩余部分是否可完美匹配。"""
+    free_reviewers = [r for r in reviewers if r not in used_reviewers]
+    free_manuscripts = [m for m in manuscripts if m not in used_manuscripts]
+    if len(free_reviewers) != len(free_manuscripts):
+        return False
+    if not free_reviewers:
+        return True
+    # 只保留两端都自由的边：若把指向已占用节点的边也传入，build_graph
+    # 会为缺失端点创建无 side 属性的节点，导致匹配基数虚高、误判可行。
+    free_edges = [
+        (r, m)
+        for r, m in zero_edges
+        if r in free_reviewers and m in free_manuscripts
+    ]
+    graph = build_graph(free_reviewers, free_manuscripts, free_edges)
+    return _max_matching_size(graph) == len(free_reviewers)
+
+
+def run_repair(
+    reviewers: list[str],
+    manuscripts: list[str],
+    pairings: list[tuple[str, str]],
+    candidates: list[tuple[str, str, int]],
+):
+    """求最小成本补边方案；不可行时返回合并图的 409 审计结果。
+
+    - 原图已存在完美匹配：直接审计原图（补边为空、成本 0）；
+    - 合并全部候选仍不可行：返回合并图的 ``run_audit`` 失败结果
+      （调用方据此复用 Hall 证人）；
+    - 否则返回 :class:`RepairResult`。
+    """
+    candidate_edges = [(r, m) for r, m, _ in candidates]
+
+    # 1) 原图已可行：成本 0 的空补充；assignment 完全沿用 /audit 规则。
+    original_audit = run_audit(reviewers, manuscripts, pairings)
+    if original_audit.perfect_match_exists:
+        return RepairResult(added=[], total_cost=0, audit=original_audit)
+
+    merged = [*pairings, *candidate_edges]
+
+    # 2) 合并全部候选仍不可行：对合并图取 Hall 证人，解释残留缺口。
+    merged_audit = run_audit(reviewers, manuscripts, merged)
+    if not merged_audit.perfect_match_exists:
+        return merged_audit
+
+    # 3) 前缀贪心（候选边按 (reviewer_id, manuscript_id) 升序编号）。
+    ordered = sorted(candidate_edges, key=lambda edge: edge)
+    k_total = len(ordered)
+    scale = 1 << k_total  # 2^K：总扰幅 < scale，故首目标恒为真实费用。
+    cost_lookup = {(r, m): c for r, m, c in candidates}
+
+    prefix: list[tuple[str, str]] = []
+    scan = 0
+    while True:
+        used_reviewers = {r for r, _ in prefix}
+        used_manuscripts = {m for _, m in prefix}
+
+        # 3.1 短表优先：仅原图边 + 强制 P 即可行 => P 已是最优方案。
+        if _original_only_feasible(
+            reviewers, manuscripts, pairings, used_reviewers, used_manuscripts
+        ):
+            break
+
+        free_reviewers = [r for r in reviewers if r not in used_reviewers]
+        free_manuscripts = [m for m in manuscripts if m not in used_manuscripts]
+        free_r_set = set(free_reviewers)
+        free_m_set = set(free_manuscripts)
+
+        # 3.2 在 P 强制、编号 < scan 的候选边禁用的自由子图上，求
+        #     （真实费用，超递增入选奖励）字典序最优匹配 M。
+        weighted: list[tuple[str, str, int]] = []
+        for r, m in pairings:
+            if r in free_r_set and m in free_m_set:
+                weighted.append((r, m, 0))
+        for index, edge in enumerate(ordered):
+            if index < scan:
+                continue
+            r, m = edge
+            if r in free_r_set and m in free_m_set:
+                reward = 1 << (k_total - 1 - index)
+                weighted.append((r, m, cost_lookup[edge] * scale - reward))
+
+        matching = set(
+            _min_cost_matching_ssp(free_reviewers, free_manuscripts, weighted)
+        )
+
+        # M 使用的最小候选边即下一条必入前缀（正确性见模块文档）。
+        next_indices = [
+            index
+            for index, edge in enumerate(ordered)
+            if index >= scan and edge in matching
+        ]
+        # 自由部分只用原图边时，3.1 已应终止；故此处必能取到候选边。
+        assert next_indices, "内部错误：前缀贪心无法继续"
+        t_index = next_indices[0]
+        prefix.append(ordered[t_index])
+        scan = t_index + 1
+
+    # 4) 对补入后的完整图执行与 /audit 完全一致的审计（字典序最小分配）。
+    total_cost = sum(cost_lookup[edge] for edge in prefix)
+    added = [(r, m, cost_lookup[(r, m)]) for r, m in prefix]
+    return RepairResult(
+        added=added,
+        total_cost=total_cost,
+        audit=run_audit(reviewers, manuscripts, [*pairings, *prefix]),
+    )

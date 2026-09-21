@@ -21,10 +21,8 @@ class Pairing(BaseModel):
         return value
 
 
-class AuditRequest(BaseModel):
-    """POST /audit 的请求体。三组列表均非空，评审人与稿件数量相等。"""
-
-    model_config = ConfigDict(extra="forbid")
+class _AssignmentBaseRequest(BaseModel):
+    """``/audit`` 与 ``/repair`` 共用的请求字段。"""
 
     reviewers: list[str] = Field(..., min_length=1, description="评审人 ID 列表（非空）")
     manuscripts: list[str] = Field(..., min_length=1, description="稿件 ID 列表（非空）")
@@ -41,6 +39,48 @@ class AuditRequest(BaseModel):
                     f"位置 {index} 的 ID 不能为空字符串"
                 )
         return values
+
+
+class AuditRequest(_AssignmentBaseRequest):
+    """POST /audit 的请求体。三组列表均非空，评审人与稿件数量相等。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class CandidatePairing(Pairing):
+    """一条可补入的候选（评审人，稿件）配对及其正整数成本。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cost: int = Field(
+        ...,
+        strict=True,
+        description="补入该配对的成本（正整数）",
+    )
+
+    @field_validator("cost", mode="before")
+    @classmethod
+    def _reject_bool(cls, value: object) -> object:
+        # strict=True 已拒绝 1.0 之类的浮点，但 bool 是 int 的子类需显式排除。
+        if isinstance(value, bool):
+            raise ValueError("成本必须为正整数，不能是布尔值")
+        return value
+
+
+class RepairRequest(_AssignmentBaseRequest):
+    """POST /repair 的请求体。
+
+    在 ``allowed_pairings``（原图边，成本视为 0）之外，
+    ``candidate_pairings`` 给出可付费补入的候选边；候选列表允许为空
+    （此时原图不可行即 409）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_pairings: list[CandidatePairing] = Field(
+        default=...,
+        description="可补入的候选配对列表（可为空；每条带正整数 cost）",
+    )
 
 
 class OutputPair(BaseModel):
@@ -108,4 +148,31 @@ class ConflictResponse(BaseModel):
     unmatched_manuscript_ids: list[str] = Field(description="未匹配的稿件 ID（已排序）")
     hall_witness: HallWitness = Field(
         description="Hall 定理证人：由交替路径构造的缺口子集及其全部邻居"
+    )
+
+
+class AddedPairing(OutputPair):
+    """被选中补入的候选配对。"""
+
+    cost: int = Field(description="补入该配对所支付的正整数成本")
+
+
+class RepairResponse(BaseModel):
+    """存在可行修复方案时的成功响应。"""
+
+    perfect_match_exists: bool = True
+    added_pairings: list[AddedPairing] = Field(
+        description=(
+            "实际补入的候选配对（按 (reviewer_id, manuscript_id) 升序）；"
+            "原图已可行时为空列表"
+        )
+    )
+    total_cost: int = Field(
+        description="补入配对的成本之和；原图已可行时为 0"
+    )
+    assignment: list[AssignedPair] = Field(
+        description=(
+            "补入后完整图的确定性分配，规则与 POST /audit 完全一致："
+            "按评审人 ID 升序的字典序最小完美匹配，并逐对标注强制性"
+        )
     )
