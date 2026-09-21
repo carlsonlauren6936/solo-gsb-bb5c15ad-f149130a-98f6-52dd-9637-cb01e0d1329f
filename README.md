@@ -8,12 +8,23 @@
 3. 对该分配中的**每一对**判断其是否为**强制配对**——即在所有完美匹配中都必然被选择；
 4. 对每个非强制配对，附一组**完整的替代分配**：它本身也是完美匹配，且不包含被审计的这对边。
 
-- 存在完美匹配 → `200`
-- 不存在完美匹配 → `409`，返回基数最大的匹配、未匹配的评审人/稿件 ID，
-  以及一份 **Hall 定理证人**（`hall_witness`），**不返回部分成功**
-- 重复 ID、重复配对、未知引用、数量不等、空列表等输入问题 → `422`，错误定位到具体字段与下标
+此外，`POST /repair` 在相同输入基础上接受一组带**正整数成本**的候选配对，
+求**仅补入候选边**即可使完美匹配成立的**最小总成本**方案：
 
-技术栈：Python · FastAPI · Pydantic v2 · NetworkX（Hopcroft–Karp + 交替有向图强连通分量）。
+- 成本相同时，按新增配对 `(reviewer_id, manuscript_id)` 排序后的列表作字典序择优；
+- 返回 `added_pairings`、`total_cost` 与修复后图上的完整 `assignment`
+  （沿用上述字典序最小规则）；原图已可行时返回成本 0 的空补充。
+
+状态码约定：
+
+- 存在完美匹配（或修复成功） → `200`
+- 不存在完美匹配（或合并全部候选仍不可行） → `409`，返回基数最大的匹配、
+  未匹配的评审人/稿件 ID，以及一份 **Hall 定理证人**（`hall_witness`），**不返回部分成功**
+- 重复 ID、重复配对、未知引用、数量不等、空列表、候选与原边重叠、非正整数成本等
+  输入问题 → `422`，错误定位到具体字段与下标
+
+技术栈：Python · FastAPI · Pydantic v2 · NetworkX（Hopcroft–Karp + 交替有向图强连通分量
++ Edmonds 开花算法最小权完美匹配）。
 
 ---
 
@@ -27,6 +38,7 @@ docker compose up --build
 
 - API 根地址：<http://localhost:8000/>
 - 审计端点：`POST http://localhost:8000/audit`
+- 修复端点：`POST http://localhost:8000/repair`
 - 交互式文档（Swagger UI）：<http://localhost:8000/docs>
 - OpenAPI 模式：<http://localhost:8000/openapi.json>
 - 健康检查：<http://localhost:8000/healthz>
@@ -225,6 +237,133 @@ curl -s -X POST http://localhost:8000/audit \
 
 ---
 
+## POST /repair（最小成本修复）
+
+在 `/audit` 的三个字段之外，请求体额外接受 `candidate_pairings`：
+一组带**正整数成本**的候选配对。服务求出**仅补入候选边**即可使完美匹配
+成立的**最小总成本**方案；成本相同时，按新增配对
+`(reviewer_id, manuscript_id)` 排序后的列表作字典序择优。
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `reviewers` | `string[]` | 非空、无重复、无空字符串 |
+| `manuscripts` | `string[]` | 非空、无重复、无空字符串，数量与 `reviewers` 相等 |
+| `allowed_pairings` | `{reviewer_id, manuscript_id}[]` | 非空、无重复配对；引用的 ID 必须分别存在于上面两个列表 |
+| `candidate_pairings` | `{reviewer_id, manuscript_id, cost}[]` | 必填、可为空列表；`cost` 为正整数；不得与 `allowed_pairings` 重叠、不得自相重复；引用的 ID 必须已知 |
+
+### 示例请求
+
+```bash
+curl -s -X POST http://localhost:8000/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reviewers": ["r0", "r1", "r2"],
+    "manuscripts": ["m0", "m1", "m2"],
+    "allowed_pairings": [
+      {"reviewer_id": "r0", "manuscript_id": "m0"},
+      {"reviewer_id": "r1", "manuscript_id": "m1"}
+    ],
+    "candidate_pairings": [
+      {"reviewer_id": "r2", "manuscript_id": "m2", "cost": 9},
+      {"reviewer_id": "r2", "manuscript_id": "m0", "cost": 2},
+      {"reviewer_id": "r0", "manuscript_id": "m2", "cost": 2}
+    ]
+  }'
+```
+
+### 200 响应（修复成功）
+
+```json
+{
+  "perfect_match_exists": true,
+  "added_pairings": [
+    {"reviewer_id": "r0", "manuscript_id": "m2"},
+    {"reviewer_id": "r2", "manuscript_id": "m0"}
+  ],
+  "total_cost": 4,
+  "assignment": [
+    {"reviewer_id": "r0", "manuscript_id": "m2", "forced": true, "alternative": null},
+    {"reviewer_id": "r1", "manuscript_id": "m1", "forced": true, "alternative": null},
+    {"reviewer_id": "r2", "manuscript_id": "m0", "forced": true, "alternative": null}
+  ]
+}
+```
+
+字段含义：
+
+- `added_pairings`：需补入的候选配对，按 `(reviewer_id, manuscript_id)` 排序。
+  上例中直接补 `r2–m2` 需成本 9，而补 `r0–m2` 与 `r2–m0` 两条仅需 4，故选后者；
+- `total_cost`：新增配对的最小总成本；**原图已可行时返回空列表与 0**；
+- `assignment`：修复后图（允许配对 + 新增配对）上的字典序最小确定性分配，
+  结构与 `/audit` 完全一致（含 `forced` / `alternative` 标注）。
+  由于成本为正，该分配恰好用完所有新增配对，不多不少。
+
+### 409 响应（合并全部候选仍不可行）
+
+```json
+{
+  "perfect_match_exists": false,
+  "detail": "即使补入全部候选配对仍不存在完美匹配；以下为合并全部候选后的基数最大匹配、未匹配双方及 Hall 定理证人。",
+  "maximum_matching": [
+    {"reviewer_id": "r1", "manuscript_id": "m1"},
+    {"reviewer_id": "r2", "manuscript_id": "m0"}
+  ],
+  "unmatched_reviewer_ids": ["r0"],
+  "unmatched_manuscript_ids": ["m2"],
+  "hall_witness": {
+    "reviewer_ids": ["r0", "r2"],
+    "neighboring_manuscript_ids": ["m0"],
+    "deficiency": 1
+  }
+}
+```
+
+结构与 `/audit` 的 409 相同，但所有数量都基于**合并全部候选配对后的图**：
+`hall_witness` 解释了即使补入全部候选仍存在的缺口（上例中 `r0` 与 `r2`
+合起来仍只有 `m0` 一篇可评）。响应不包含 `added_pairings` 与 `assignment`。
+
+### 422 响应（候选配对的校验）
+
+在 `/audit` 的全部校验之上，候选配对额外引入以下错误类型
+（`cost` 的非正整数/非整数校验由 Pydantic 在 schema 阶段完成）：
+
+| 错误类型 | 触发条件 | `loc` 定位 |
+| --- | --- | --- |
+| `duplicate_candidate_pairing` | 候选配对自相重复（无论成本是否相同） | `body.candidate_pairings.<下标>` |
+| `candidate_overlaps_allowed` | 候选与 `allowed_pairings` 中已有配对重叠 | `body.candidate_pairings.<下标>` |
+| `unknown_reviewer` | 候选引用了不存在的评审人 | `body.candidate_pairings.<下标>.reviewer_id` |
+| `unknown_manuscript` | 候选引用了不存在的稿件 | `body.candidate_pairings.<下标>.manuscript_id` |
+| `greater_than` / `int_type` | 成本非正整数（0、负数、浮点、字符串、布尔） | `body.candidate_pairings.<下标>.cost` |
+
+示例（候选与允许配对重叠 + 候选自相重复 + 未知引用，一次聚合返回）：
+
+```json
+{
+  "detail": [
+    {
+      "type": "candidate_overlaps_allowed",
+      "loc": ["body", "candidate_pairings", 0],
+      "msg": "候选配对与允许配对重叠：('r0', 'm0')",
+      "input": {"reviewer_id": "r0", "manuscript_id": "m0"}
+    },
+    {
+      "type": "duplicate_candidate_pairing",
+      "loc": ["body", "candidate_pairings", 2],
+      "msg": "候选配对重复：('r2', 'm2')",
+      "input": {"reviewer_id": "r2", "manuscript_id": "m2"}
+    },
+    {
+      "type": "unknown_reviewer",
+      "loc": ["body", "candidate_pairings", 3, "reviewer_id"],
+      "msg": "未知评审人引用：'ghost' 不在 reviewers 列表中",
+      "input": "ghost"
+    }
+  ]
+}
+```
+
+---
+
 ## 算法说明
 
 - **最大匹配 / 完美匹配判定**：NetworkX 的 Hopcroft–Karp
@@ -245,6 +384,18 @@ curl -s -X POST http://localhost:8000/audit \
   N(S) 恰为 Z ∩ 稿件，且 `|S| − |N(S)|` = 未匹配评审人数 = 全局缺口
   （Kőnig–Ore 定理）。源点与邻接均按 ID 排序，可达集与遍历顺序无关，
   证人对相同输入完全确定。
+- **最小成本修复（/repair）**：允许边权重视为 0、候选边权重视为其成本时，
+  「最小成本完美匹配」用到的候选边集合即最小成本补充方案（成本为正，多补无益）。
+  平局择优：候选边按 `(reviewer_id, manuscript_id)` 排序后第 i 条（共 k 条）赋权
+  `cost·2^k − 2^(k−1−i)`，允许边赋权 0——主目标最小化总成本，次目标最大化
+  「按序是否纳入」指示向量的字典序，后者等价于新增配对排序列表字典序最小
+  （正成本保证同成本方案不会互为前缀）。一次最小权完美匹配即可同时确定两个层级，
+  且所有最优解的候选边集合相同，结果对相同输入完全确定。最小权完美匹配由
+  Edmonds 开花算法完成（`networkx.max_weight_matching`，纯 Python，权重取负，
+  `maxcardinality=True` 保证完美匹配）。
+- **修复后的 assignment**：在「允许配对 + 新增配对」图上复用上述全部规则
+  （字典序最小分配 + 强制性标注）；由正成本可证该分配恰好用完所有新增边。
+  合并全部候选仍不可行时，在合并图上复用 Hall 证人构造，作为 409 的解释。
 
 适用规模：典型会议量级（两侧各 ≤100、每人若干候选）亚秒级完成；
 数百规模也可在数秒级返回。
@@ -254,12 +405,13 @@ curl -s -X POST http://localhost:8000/audit \
 ```
 app/
   __init__.py
-  main.py        # FastAPI 路由、422/409 语义校验与响应组装
-  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人
+  main.py        # FastAPI 路由（/audit、/repair）、422/409 语义校验与响应组装
+  matching.py    # 二部图、确定性匹配、SCC 强制性、交替环替代分配、Hall 证人、最小成本修复
   schemas.py     # Pydantic 请求/响应模型
 tests/
   test_api.py    # HTTP 层：200/409/422、Hall 证人与错误定位
   test_matching.py# 算法层：200 组随机图全排列暴力交叉验证 + Hall 证人不变量
+  test_repair.py # /repair：最小成本、平局字典序、422 定位 + 300 组暴力交叉验证
 Dockerfile
 docker-compose.yml
 requirements.txt

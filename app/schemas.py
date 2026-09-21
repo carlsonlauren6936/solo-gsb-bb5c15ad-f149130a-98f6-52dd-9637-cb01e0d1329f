@@ -43,6 +43,25 @@ class AuditRequest(BaseModel):
         return values
 
 
+class CandidatePairing(Pairing):
+    """一条可补入的候选配对，带正整数成本。
+
+    成本使用严格整数：布尔、浮点、字符串一律拒绝（422）。
+    """
+
+    cost: int = Field(..., strict=True, gt=0, description="补入该配对的成本（正整数）")
+
+
+class RepairRequest(AuditRequest):
+    """POST /repair 的请求体：在 /audit 输入基础上增加候选配对列表。"""
+
+    candidate_pairings: list[CandidatePairing] = Field(
+        ...,
+        description="可补入的候选配对（可为空）；不得与 allowed_pairings 重叠、"
+        "不得自相重复，成本为正整数",
+    )
+
+
 class OutputPair(BaseModel):
     """审计输出中的单条配对。"""
 
@@ -73,6 +92,21 @@ class AuditResponse(BaseModel):
     perfect_match_exists: bool = True
     assignment: list[AssignedPair] = Field(
         description="按评审人 ID 排序后字典序最小的确定性分配，并逐对标注强制性"
+    )
+
+
+class RepairResponse(BaseModel):
+    """修复成功响应：最小成本补充方案及修复后的完整分配。"""
+
+    perfect_match_exists: bool = True
+    added_pairings: list[OutputPair] = Field(
+        description="需补入的候选配对，按 (reviewer_id, manuscript_id) 排序；"
+        "总成本最小，成本相同时该排序列表字典序最小；原图已可行时为空"
+    )
+    total_cost: int = Field(description="补入配对的最小总成本（原图已可行时为 0）")
+    assignment: list[AssignedPair] = Field(
+        description="修复后图（允许配对 + 新增配对）上的字典序最小确定性分配，"
+        "并逐对标注强制性"
     )
 
 

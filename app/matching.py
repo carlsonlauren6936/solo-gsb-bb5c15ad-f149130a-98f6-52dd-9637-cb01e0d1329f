@@ -38,6 +38,29 @@ M-交替路径（同一交替有向图定向）遍历可达节点 Z：
   **完整的**、合法的、不含 (r, m) 的完美匹配，作为替代分配（witness）。
 
 邻接按节点 ID 排序，使 BFS 与全部输出确定性。
+
+最小成本修复（POST /repair）
+----------------------------
+允许补入带正整数成本的候选配对，求使完美匹配成立的最小总成本方案：
+
+- 允许边权重视为 0、候选边权重视为其成本时，「最小成本完美匹配」所用
+  的候选边集合即最小成本补充方案：任一可行补充集 S 都含一个完美匹配，
+  该匹配只用到 S 的子集，而正成本下子集成本不超过 S；
+- 平局（总成本相同）时，按新增配对 (reviewer_id, manuscript_id) 排序后的
+  列表作字典序择优。该比较等价于对「按序是否纳入各候选」的 0/1 指示
+  向量取字典序最大：设两边集在第一不同候选 e 处分别为纳入/不纳入，
+  正成本保证同成本集合不会互为前缀，故含 e 者的排序列表字典序更小。
+  于是第 i 条候选边（按配对排序，共 k 条）赋权
+  ``cost * 2^k - 2^(k-1-i)``、允许边赋权 0，一次最小权完美匹配即可
+  同时确定两个层级；奖金为 2 的幂，和唯一确定集合，故所有最优解的
+  候选边集合相同，补充方案完全确定；
+- 最小权完美匹配由 Edmonds 开花算法完成
+  （``networkx.max_weight_matching``，纯 Python；权重取负，
+  ``maxcardinality=True`` 保证返回完美匹配）；
+- 修复成功后的 assignment 在「允许边 + 新增边」图上复用 run_audit，
+  沿用字典序最小规则；由正成本可证该分配恰好用完所有新增边
+  （否则其候选边子集成本更低，与最小性矛盾）；
+- 合并全部候选仍不可行时，在合并图上复用 Hall 证人解释缺口（409）。
 """
 
 from dataclasses import dataclass, field
@@ -125,6 +148,23 @@ class AuditResult:
     unmatched_manuscripts: list[str] = field(default_factory=list)
     #: 仅 409（不存在完美匹配）时填充。
     hall_witness: HallWitness | None = None
+
+
+@dataclass
+class RepairResult:
+    """修复计算结果。
+
+    - ``repairable`` 为 True：``added`` 为按 (rid, mid) 排序的新增配对，
+      ``total_cost`` 为最小总成本，``audit`` 为修复后图上的审计结果
+      （必然存在完美匹配）；
+    - ``repairable`` 为 False：合并全部候选仍不可行，``audit`` 为合并图
+      上的审计结果（含 Hall 证人）。
+    """
+
+    repairable: bool
+    added: list[tuple[str, str]] = field(default_factory=list)
+    total_cost: int = 0
+    audit: AuditResult | None = None
 
 
 def lex_smallest_matching(
@@ -388,4 +428,88 @@ def run_audit(
         perfect_match_exists=True,
         pairs=entries,
         max_matching_size=max_size,
+    )
+
+
+def _min_cost_added_set(
+    graph: nx.Graph,
+    reviewers: list[str],
+    candidates: list[tuple[str, str, int]],
+) -> list[tuple[str, str]]:
+    """在含全部候选边的图上求最小成本完美匹配，返回其候选边集合（已排序）。
+
+    第 i 条候选边（按 (rid, mid) 排序，共 k 条）赋权
+    ``cost * 2^k - 2^(k-1-i)``，允许边权 0：主目标最小化总成本，
+    次目标最大化按序纳入指示向量的字典序（等价于新增配对排序列表
+    字典序最小）。奖金为 2 的幂，其和唯一确定集合，故所有最优解的
+    候选边集合相同，返回值与开花算法的内部平局无关。
+    """
+    ordered = sorted(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    k = len(ordered)
+    scale = 1 << k
+
+    weighted = nx.Graph(graph)
+    for u, v, data in weighted.edges(data=True):
+        data["weight"] = 0
+    for index, (reviewer_id, manuscript_id, cost) in enumerate(ordered):
+        bonus = 1 << (k - 1 - index)
+        # max_weight_matching 求最大权：取负即最小化上述扰动权重。
+        weighted[_rnode(reviewer_id)][_mnode(manuscript_id)]["weight"] = (
+            bonus - cost * scale
+        )
+
+    matching = nx.max_weight_matching(
+        weighted, maxcardinality=True, weight="weight"
+    )
+    # 完美匹配的存在性已前置校验；防御性断言。
+    assert len(matching) == len(reviewers)
+
+    candidate_ids = {(r, m) for r, m, _ in candidates}
+    added: list[tuple[str, str]] = []
+    for a, b in matching:
+        reviewer_id, manuscript_id = (
+            (a[1], b[1]) if a[0] == REVIEWER else (b[1], a[1])
+        )
+        if (reviewer_id, manuscript_id) in candidate_ids:
+            added.append((reviewer_id, manuscript_id))
+    added.sort()
+    return added
+
+
+def run_repair(
+    reviewers: list[str],
+    manuscripts: list[str],
+    pairings: list[tuple[str, str]],
+    candidates: list[tuple[str, str, int]],
+) -> RepairResult:
+    """最小成本修复：补入候选配对使完美匹配成立。
+
+    ``candidates`` 为已通过校验的 (rid, mid, cost) 列表（与允许配对不
+    重叠、互不重复、成本为正整数）。
+    """
+    base_graph = build_graph(reviewers, manuscripts, pairings)
+    if _max_matching_size(base_graph) == len(reviewers):
+        # 原图已可行：零成本空补充，直接审计原图。
+        return RepairResult(
+            repairable=True,
+            audit=run_audit(reviewers, manuscripts, pairings),
+        )
+
+    merged_pairings = list(pairings) + [(r, m) for r, m, _ in candidates]
+    merged_graph = build_graph(reviewers, manuscripts, merged_pairings)
+    if _max_matching_size(merged_graph) != len(reviewers):
+        # 合并全部候选仍不可行：复用合并图上的 Hall 证人解释缺口。
+        return RepairResult(
+            repairable=False,
+            audit=run_audit(reviewers, manuscripts, merged_pairings),
+        )
+
+    added = _min_cost_added_set(merged_graph, reviewers, candidates)
+    cost_of = {(r, m): cost for r, m, cost in candidates}
+    total_cost = sum(cost_of[edge] for edge in added)
+    return RepairResult(
+        repairable=True,
+        added=added,
+        total_cost=total_cost,
+        audit=run_audit(reviewers, manuscripts, list(pairings) + added),
     )
